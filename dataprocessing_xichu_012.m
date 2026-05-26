@@ -14,7 +14,7 @@ sampling_rate      = 12000;
 wavelet            = 'amor';
 voices_per_octave  = 48;
 target_size        = [224 224];
-target_num         = 118;       % 每类每负载样本数
+% target_num 不再写死，运行时会自动取每负载下各类的最少样本数
 
 % 训练集内部划分比例
 train_split = 0.85;             % 训练:验证 = 85:15
@@ -112,10 +112,7 @@ for ld = 1:3
         sig_len = length(signal);
         
         num_samples = floor((sig_len - window_len) / step) + 1;
-        if class_label == 0
-            num_samples = min(num_samples, target_num);
-        end
-        
+
         fprintf('  [负载%d 类别%2d] %s: %d 样本\n', ...
                 load_idx, class_label, filename, num_samples);
         
@@ -139,19 +136,29 @@ for ld = 1:3
         end
     end
     
-    % 平衡: 随机下采样至每类 target_num 个
-    fprintf('  平衡负载 %d 至每类 %d...\n', load_idx, target_num);
+    % 自动计算该负载下最少样本数，按时间顺序保留前 N 个
+    min_count = Inf;
     for c = 0:NUM_CLASSES-1
         class_folder = fullfile(temp_dir, sprintf('load%d', load_idx), sprintf('class%d', c));
         mat_files = dir(fullfile(class_folder, '*.mat'));
-        
-        if length(mat_files) <= target_num
+        min_count = min(min_count, length(mat_files));
+    end
+    fprintf('  平衡负载 %d 至每类 %d (自动取各类最少样本数)\n', load_idx, min_count);
+
+    for c = 0:NUM_CLASSES-1
+        class_folder = fullfile(temp_dir, sprintf('load%d', load_idx), sprintf('class%d', c));
+        mat_files = dir(fullfile(class_folder, '*.mat'));
+
+        if length(mat_files) <= min_count
             continue;
         end
-        
+
+        % 按样本序号排序（时间顺序），保留前 min_count 个
         nums = cellfun(@(x) sscanf(x, 'class_%*d_%d.mat'), {mat_files.name});
-        keep_nums = sort(randsample(nums, target_num));
-        delete_nums = setdiff(nums, keep_nums);
+        [~, sort_idx] = sort(nums);
+        sorted_nums = nums(sort_idx);
+        % 丢弃末尾样本（晚时间段），减少 train/val 时间泄露
+        delete_nums = sorted_nums(min_count+1:end);
         for i = 1:length(delete_nums)
             delete(fullfile(class_folder, ...
                   sprintf('class_%d_%04d.mat', c, delete_nums(i))));
@@ -160,29 +167,50 @@ for ld = 1:3
 end
 
 %% ================================================================
-% 第2步: 混合划分 → 训练(0HP+1HP) / 验证(来自训练) / 测试(2HP)
+% 第2步: 时域连续划分 → 训练(0HP+1HP) / 验证(来自训练) / 测试(2HP)
+% 每类样本按时间顺序前85%→训练、后15%→验证，避免50%重叠窗口泄露
 %% ================================================================
-fprintf('\n========== 第2步: 跨负载混合划分 ==========\n');
+fprintf('\n========== 第2步: 跨负载时域连续划分 ==========\n');
 
-% --- 加载训练数据 (负载0 + 负载1) ---
-fprintf('加载训练数据 (0HP + 1HP)...\n');
 train_data_cell  = {};
 train_labels_all = [];
+val_data_cell    = {};
+val_labels_all   = [];
 
 for ld = 0:1  % 仅 0HP 和 1HP
     for c = 0:NUM_CLASSES-1
         class_folder = fullfile(temp_dir, sprintf('load%d', ld), sprintf('class%d', c));
         mat_files = dir(fullfile(class_folder, '*.mat'));
-        for m = 1:length(mat_files)
-            load(fullfile(class_folder, mat_files(m).name), 'mag_norm');
+
+        % 按样本序号（生成顺序 = 时间先后）排序
+        nums = cellfun(@(x) sscanf(x, 'class_%*d_%d.mat'), {mat_files.name});
+        [~, sort_idx] = sort(nums);
+
+        n_samples = length(mat_files);
+        n_tr = round(n_samples * train_split);
+
+        % 前 n_tr 个（时间较早）→ 训练集
+        for m = 1:n_tr
+            idx = sort_idx(m);
+            load(fullfile(class_folder, mat_files(idx).name), 'mag_norm');
             img = imresize(mag_norm, target_size);
             train_data_cell{end+1}  = img;  %#ok<AGROW>
             train_labels_all(end+1) = c;    %#ok<AGROW>
         end
+
+        % 后 (n_samples - n_tr) 个（时间较晚）→ 验证集
+        for m = n_tr+1:n_samples
+            idx = sort_idx(m);
+            load(fullfile(class_folder, mat_files(idx).name), 'mag_norm');
+            img = imresize(mag_norm, target_size);
+            val_data_cell{end+1}  = img;  %#ok<AGROW>
+            val_labels_all(end+1) = c;    %#ok<AGROW>
+        end
     end
 end
-fprintf('  训练总样本: %d (理论 2×10×%d = %d)\n', ...
-        length(train_labels_all), target_num, 2*NUM_CLASSES*target_num);
+
+fprintf('  训练总样本: %d\n', length(train_labels_all));
+fprintf('  验证总样本: %d\n', length(val_labels_all));
 
 % --- 加载测试数据 (负载2) ---
 fprintf('加载测试数据 (2HP)...\n');
@@ -192,50 +220,48 @@ test_labels_all = [];
 for c = 0:NUM_CLASSES-1
     class_folder = fullfile(temp_dir, 'load2', sprintf('class%d', c));
     mat_files = dir(fullfile(class_folder, '*.mat'));
+
+    % 按时间顺序排序后加载
+    nums = cellfun(@(x) sscanf(x, 'class_%*d_%d.mat'), {mat_files.name});
+    [~, sort_idx] = sort(nums);
+
     for m = 1:length(mat_files)
-        load(fullfile(class_folder, mat_files(m).name), 'mag_norm');
+        idx = sort_idx(m);
+        load(fullfile(class_folder, mat_files(idx).name), 'mag_norm');
         img = imresize(mag_norm, target_size);
         test_data_cell{end+1}  = img;  %#ok<AGROW>
         test_labels_all(end+1) = c;    %#ok<AGROW>
     end
 end
-fprintf('  测试总样本: %d (理论 1×10×%d = %d)\n', ...
-        length(test_labels_all), target_num, NUM_CLASSES*target_num);
+fprintf('  测试总样本: %d\n', length(test_labels_all));
 
 % --- 检查各类分布 ---
 fprintf('\n各类别样本分布:\n');
-fprintf('  类别 | 训练 | 测试\n');
-fprintf('  -----|------|-----\n');
+fprintf('  类别 | 训练 | 验证 | 测试\n');
+fprintf('  -----|------|------|-----\n');
 train_counts = histcounts(train_labels_all, 0:10);
+val_counts   = histcounts(val_labels_all, 0:10);
 test_counts  = histcounts(test_labels_all, 0:10);
 for c = 0:NUM_CLASSES-1
-    fprintf('  %4d | %4d | %4d\n', c, train_counts(c+1), test_counts(c+1));
+    fprintf('  %4d | %4d | %4d | %4d\n', c, train_counts(c+1), val_counts(c+1), test_counts(c+1));
 end
 
-% --- 组装训练/验证/测试矩阵 ---
-% 训练集: 转为 4D 并打乱
-X_train_all = cat(4, train_data_cell{:});                    % [224, 224, 1, N_train]
-y_train_all = train_labels_all(:);
-
+% --- 各自内部打乱 ---
 rng(42);
-shuffle_idx = randperm(length(y_train_all));
-X_train_all = X_train_all(:, :, :, shuffle_idx);
-y_train_all = y_train_all(shuffle_idx);
+shuffle_tr = randperm(length(train_labels_all));
+X_train = cat(4, train_data_cell{:});
+y_train = train_labels_all(:);
+X_train = X_train(:, :, :, shuffle_tr);
+y_train = y_train(shuffle_tr);
 
-N_train_total = size(X_train_all, 4);
-n_tr = round(N_train_total * train_split);
+rng(43);
+shuffle_val = randperm(length(val_labels_all));
+X_val = cat(4, val_data_cell{:});
+y_val = val_labels_all(:);
+X_val = X_val(:, :, :, shuffle_val);
+y_val = y_val(shuffle_val);
 
-X_train = X_train_all(:, :, :, 1:n_tr);
-y_train = y_train_all(1:n_tr);
-
-X_val = X_train_all(:, :, :, n_tr+1:end);
-y_val = y_train_all(n_tr+1:end);
-
-fprintf('\n  训练集: %d 样本\n', n_tr);
-fprintf('  验证集: %d 样本\n', N_train_total - n_tr);
-
-% 测试集
-X_test = cat(4, test_data_cell{:});                          % [224, 224, 1, N_test]
+X_test = cat(4, test_data_cell{:});
 y_test = test_labels_all(:);
 
 % 转为 PyTorch NCHW 格式: [H, W, C, N] → [N, C, H, W]
