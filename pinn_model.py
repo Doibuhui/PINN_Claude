@@ -347,20 +347,33 @@ class PINNFaultDiagnosis(nn.Module):
     
     def physics_loss(self, features):
         """
-        物理约束损失
-        基于频域特性：故障信号在特定频率应有能量集中
+        物理约束: 频谱稀疏性
+
+        轴承故障信号 = 周期性冲击脉冲
+        → 调制谱能量集中在故障特征频率及其倍频
+        → 频谱应呈现稀疏分布（少数频率分量集中大部分能量）
+
+        L1/L2 稀疏度量:
+          值 ≈ 1    → 完美稀疏 (单频峰, 理想故障信号)
+          值 ≈ √N   → 完全平坦 (白噪声)
+          值越小     → 频谱越稀疏 → 越符合故障物理特征
+
+        与 FourierConv 的协同:
+          FourierConv 学习频域非线性变换用于判别
+          稀疏性 loss 约束特征频谱呈现"稀疏峰值"形态
+          两者方向一致: 找到并保留尖锐的频域特征
         """
-        # 计算频域能量分布
-        freq_energy = torch.fft.fft2(features)
-        freq_energy = torch.abs(freq_energy)
-        
-        # 频域能量应平滑分布（物理约束）
-        diff_h = torch.diff(freq_energy, dim=2)
-        diff_w = torch.diff(freq_energy, dim=3)
-        
-        smoothness_loss = torch.mean(diff_h ** 2) + torch.mean(diff_w ** 2)
-        
-        return smoothness_loss
+        # 沿时间轴做 1D FFT → 调制谱 (包络谱近似)
+        time_spectrum = torch.fft.rfft(features, dim=-1)
+        time_mag = torch.abs(time_spectrum)  # [B, C, H, W_freq]
+
+        eps = 1e-8
+        # 空间维度和频率维度取均值，保留 batch 和 channel
+        l1 = time_mag.mean(dim=[2, 3])
+        l2 = torch.sqrt((time_mag ** 2).mean(dim=[2, 3]) + eps)
+        sparsity = (l1 / (l2 + eps)).mean()  # 标量
+
+        return sparsity
     
     def extract_features(self, x):
         physics_features = self.physics_block(x)

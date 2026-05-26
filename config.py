@@ -30,7 +30,7 @@ class Config:
     WEIGHT_DECAY = 1e-3
     
     # PINN物理损失权重
-    LAMBDA_PHYSICS = 0.0  # 物理约束损失权重 (FourierConv已内建频域表达，平滑约束与故障特征冲突)
+    LAMBDA_PHYSICS = 0.01  # 物理约束: 频谱稀疏性，小权重避免过度抑制特征
     
     # 设备
     DEVICE = 'cuda'  # 'cuda' 或 'cpu'
