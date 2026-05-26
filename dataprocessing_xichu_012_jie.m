@@ -131,19 +131,22 @@ for ld = 1:3
                 seg = med_deconv(seg, MED_FILTER_SIZE, MED_MAX_ITER, MED_TOL);
             end
             
-            % CWT (Morlet), 只保留幅值
+            % CWT (Morlet) — 保留幅值 + 连续相位 (cos/sin, 消除±π断崖)
             [cfs, ~] = cwt(seg, wavelet, sampling_rate, ...
                            'VoicesPerOctave', voices_per_octave);
-            mag = abs(cfs);
-            
-            % 线性归一化到 [0, 1]
+            mag  = abs(cfs);
+            ph   = angle(cfs);           % 相位, [-π, π]
+            pcos = cos(ph);              % [-1, 1] 连续, 无断崖
+            psin = sin(ph);              % [-1, 1] 连续
+
+            % 幅值线性归一化到 [0, 1]; 相位 cos/sin 本身在 [-1,1] 无需归一化
             mag_norm = (mag - min(mag(:))) / (max(mag(:)) - min(mag(:)));
-            
-            % 保存为独立 .mat 文件
+
+            % 保存为独立 .mat 文件 (3通道: 幅值 + 相位cos + 相位sin)
             save_path = fullfile(temp_dir, sprintf('load%d', load_idx), ...
                         sprintf('class%d', class_label), ...
                         sprintf('class_%d_%04d.mat', class_label, s));
-            save(save_path, 'mag_norm');
+            save(save_path, 'mag_norm', 'pcos', 'psin');
         end
     end
     
@@ -203,8 +206,11 @@ for ld = 0:1  % 仅 0HP 和 1HP
         % 前 n_tr 个（时间较早）→ 训练集
         for m = 1:n_tr
             idx = sort_idx(m);
-            load(fullfile(class_folder, mat_files(idx).name), 'mag_norm');
-            img = imresize(mag_norm, target_size);
+            load(fullfile(class_folder, mat_files(idx).name), 'mag_norm', 'pcos', 'psin');
+            mag_img = imresize(mag_norm, target_size);
+            cos_img = imresize(pcos, target_size);
+            sin_img = imresize(psin, target_size);
+            img = cat(3, mag_img, cos_img, sin_img);  % [224, 224, 3]
             train_data_cell{end+1}  = img;  %#ok<AGROW>
             train_labels_all(end+1) = c;    %#ok<AGROW>
         end
@@ -212,8 +218,11 @@ for ld = 0:1  % 仅 0HP 和 1HP
         % 后 (n_samples - n_tr) 个（时间较晚）→ 验证集
         for m = n_tr+1:n_samples
             idx = sort_idx(m);
-            load(fullfile(class_folder, mat_files(idx).name), 'mag_norm');
-            img = imresize(mag_norm, target_size);
+            load(fullfile(class_folder, mat_files(idx).name), 'mag_norm', 'pcos', 'psin');
+            mag_img = imresize(mag_norm, target_size);
+            cos_img = imresize(pcos, target_size);
+            sin_img = imresize(psin, target_size);
+            img = cat(3, mag_img, cos_img, sin_img);
             val_data_cell{end+1}  = img;  %#ok<AGROW>
             val_labels_all(end+1) = c;    %#ok<AGROW>
         end
@@ -238,8 +247,11 @@ for c = 0:NUM_CLASSES-1
 
     for m = 1:length(mat_files)
         idx = sort_idx(m);
-        load(fullfile(class_folder, mat_files(idx).name), 'mag_norm');
-        img = imresize(mag_norm, target_size);
+        load(fullfile(class_folder, mat_files(idx).name), 'mag_norm', 'pcos', 'psin');
+        mag_img = imresize(mag_norm, target_size);
+        cos_img = imresize(pcos, target_size);
+        sin_img = imresize(psin, target_size);
+        img = cat(3, mag_img, cos_img, sin_img);
         test_data_cell{end+1}  = img;  %#ok<AGROW>
         test_labels_all(end+1) = c;    %#ok<AGROW>
     end

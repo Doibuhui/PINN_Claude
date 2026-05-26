@@ -12,7 +12,7 @@ class Config:
     
     # 图像参数
     IMG_SIZE = 224
-    IN_CHANNELS = 1
+    IN_CHANNELS = 3      # 通道数: 3 = 幅值+cos(相位)+sin(相位); 1 = 仅幅值
     NUM_CLASSES = 10
     
     # 类别标签
