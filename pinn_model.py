@@ -5,6 +5,111 @@ PINN模型 - 物理信息神经网络
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+
+
+class LearnableCWT(nn.Module):
+    """
+    可学习小波变换层 — 预处理创新核心
+
+    把 MATLAB 固定 Morlet CWT 替换为 PyTorch 可学习版本:
+    - 中心频率 (ω₀) 和带宽 (σ) 是 nn.Parameter, 跟分类 loss 一起优化
+    - 多个小波并行, 各自学习不同的频率特性
+    - 频域实现 (FFT × ψ → IFFT), 比时域卷积快很多
+    - 输出保留幅值 + 相位 (cos/sin), 供 FourierConv 处理
+
+    输入: [B, 1, signal_len]  原始振动信号
+    输出: [B, n_w*2, n_scales, signal_len]  (每个小波×{幅值归一化, cos相位, sin相位})
+    """
+
+    def __init__(self, n_scales=64, n_wavelets=2, freq_range=(10, 5500), sampling_rate=12000):
+        super().__init__()
+        self.n_wavelets = n_wavelets
+        self.n_scales = n_scales
+        self.sr = sampling_rate
+
+        # 对数分布的尺度 (覆盖轴承故障特征频率范围)
+        # 物理频率 ↔ 尺度关系: scale = sr / (2π × freq)
+        freq_low, freq_high = freq_range
+        scales = torch.tensor(
+            sampling_rate / (2 * np.pi * np.logspace(
+                np.log10(freq_high), np.log10(freq_low), n_scales)),
+            dtype=torch.float32
+        )
+        self.register_buffer('scales', scales)
+
+        # 可学习小波参数 (每个小波滤波器独立)
+        # 初始化在 Morlet 默认值附近: ω₀=6, σ=1
+        self.log_center_freq = nn.Parameter(
+            torch.log(torch.tensor([6.0] * n_wavelets))
+        )
+        self.log_bandwidth = nn.Parameter(
+            torch.zeros(n_wavelets)  # log(1) = 0
+        )
+
+    def _build_morlet_filter(self, signal_len):
+        """构建 Morlet 小波频域滤波器 [n_w, n_scales, F]"""
+        freqs = torch.fft.rfftfreq(signal_len, d=1.0 / self.sr).to(
+            self.scales.device
+        )  # [F]
+
+        center_freq = self.log_center_freq.exp()  # [n_w]
+        bandwidth = self.log_bandwidth.exp()      # [n_w]
+
+        # scales: [n_s], center_freq: [n_w], bandwidth: [n_w], freqs: [F]
+        # 广播: [n_w, n_s, 1]
+        s = self.scales.view(1, -1, 1)          # [1, n_s, 1]
+        w0 = center_freq.view(-1, 1, 1)         # [n_w, 1, 1]
+        sig = bandwidth.view(-1, 1, 1)          # [n_w, 1, 1]
+        f = freqs.view(1, 1, -1)                # [1, 1, F]
+
+        # Morlet 频域响应:
+        # ψ̂(ω) = σ·s · exp(-(ω·s - ω₀)² · σ² / 2)  (主高斯峰)
+        #         - correction (确保零均值)
+        omega_s = 2 * np.pi * f * s              # [n_w, n_s, F]
+        exponent = -0.5 * (omega_s - w0) ** 2 * sig ** 2
+        psi = sig * s * torch.exp(exponent)      # [n_w, n_s, F] 复数
+
+        # 零均值修正: 减去直流分量, 使小波积分=0
+        psi = psi - psi.mean(dim=-1, keepdim=True)
+
+        return psi
+
+    def forward(self, x):
+        """
+        x: [B, 1, signal_len]
+        返回: [B, n_w*2, n_scales, signal_len]  (每小波×{幅值, cos, sin})
+        """
+        B, C, T = x.shape
+
+        # 1. FFT
+        signal_fft = torch.fft.rfft(x, dim=-1)    # [B, 1, F]
+
+        # 2. 构建小波滤波器
+        psi = self._build_morlet_filter(T)         # [n_w, n_s, F]
+
+        # 3. 频域滤波: 广播相乘
+        # signal_fft: [B, 1, 1, 1, F] × psi: [1, n_w, n_s, 1, F]
+        filt = signal_fft.unsqueeze(1).unsqueeze(2) * psi.unsqueeze(0).unsqueeze(3)
+        # filt: [B, n_w, n_s, 1, F]
+
+        # 4. IFFT → CWT 系数
+        cwt_coeffs = torch.fft.irfft(filt, n=T, dim=-1)  # [B, n_w, n_s, 1, T]
+        cwt_coeffs = cwt_coeffs.squeeze(3)                # [B, n_w, n_s, T]
+
+        # 5. 提取幅值和相位
+        mag = torch.abs(cwt_coeffs)               # [B, n_w, n_s, T]
+        phase = torch.angle(cwt_coeffs)            # [B, n_w, n_s, T]
+
+        # 6. 归一化
+        mag_flat = mag.reshape(B, -1)
+        mag_norm = (mag_flat / (mag_flat.sum(dim=1, keepdim=True) + 1e-8)
+                    ).reshape(B, self.n_wavelets, self.n_scales, T)
+        phase_cos = torch.cos(phase)
+        phase_sin = torch.sin(phase)
+
+        # 7. 输出: [B, n_w*2, n_scales, T]
+        return torch.cat([mag_norm, phase_cos, phase_sin], dim=1)
 
 
 class BSplineActivation(nn.Module):
@@ -309,29 +414,41 @@ class PINNFaultDiagnosis(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        
+
+        # 可选: LearnableCWT 端到端预处理 (原始信号 → 时频表示)
+        self.use_raw_cwt = getattr(config, 'USE_RAW_SIGNAL', False)
+        if self.use_raw_cwt:
+            self.learnable_cwt = LearnableCWT(
+                n_scales=getattr(config, 'N_SCALES', 64),
+                n_wavelets=getattr(config, 'N_WAVELETS', 2)
+            )
+            # CWT 输出通道: n_wavelets * 3 (幅值 + cos + sin)
+            in_ch = getattr(config, 'N_WAVELETS', 2) * 3
+        else:
+            in_ch = config.IN_CHANNELS  # 3 通道 (mag+cos+sin)
+
         # 物理约束块
         conv_type = getattr(config, 'CONV_TYPE', 'fourier')
-        self.physics_block = PhysicsBlock(config.IN_CHANNELS, conv_type=conv_type)
-        
+        self.physics_block = PhysicsBlock(in_ch, conv_type=conv_type)
+
         # CNN特征提取
         self.layer1 = self._make_layer(16, 32, 2, stride=2)
         self.layer2 = self._make_layer(32, 64, 2, stride=2)
         self.layer3 = self._make_layer(64, 128, 2, stride=2)
         self.layer4 = self._make_layer(128, 256, 2, stride=2)
-        
+
         # 全局平均池化
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        
+
         # 多头自注意力 (可选)
         self.use_mha = getattr(config, 'USE_MHA', True)
         if self.use_mha:
             self.mha = MultiHeadSelfAttention(dim=256, num_heads=8, dropout=0.1)
             self.mha_norm = nn.LayerNorm(256)
-        
+
         # 分类器
         self.fc = nn.Linear(256, config.NUM_CLASSES)
-        
+
         # 物理约束参数（可学习）
         self.freq_weight = nn.Parameter(torch.ones(1, 16, 1, 1))
         
@@ -376,13 +493,16 @@ class PINNFaultDiagnosis(nn.Module):
         return sparsity
     
     def extract_features(self, x):
+        if self.use_raw_cwt:
+            x = self.learnable_cwt(x)  # [B, 1, T] → [B, 4, n_s, T]
+
         physics_features = self.physics_block(x)
         physics_features = physics_features * self.freq_weight
         x = self.layer1(physics_features)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-        
+
         if self.use_mha:
             B, C, H, W = x.shape
             x_tokens = x.flatten(2).transpose(1, 2)
@@ -390,30 +510,12 @@ class PINNFaultDiagnosis(nn.Module):
             x_attn = x_tokens + x_attn
             x_attn = self.mha_norm(x_attn)
             x = x_attn.transpose(1, 2).reshape(B, C, H, W)
-        
+
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         return x, physics_features
-    
+
     def forward(self, x):
-        physics_features = self.physics_block(x)
-        physics_features = physics_features * self.freq_weight
-        
-        x = self.layer1(physics_features)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        
-        if self.use_mha:
-            B, C, H, W = x.shape
-            x_tokens = x.flatten(2).transpose(1, 2)
-            x_attn = self.mha(x_tokens)
-            x_attn = x_tokens + x_attn
-            x_attn = self.mha_norm(x_attn)
-            x = x_attn.transpose(1, 2).reshape(B, C, H, W)
-        
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        logits = self.fc(x)
-        
+        features, physics_features = self.extract_features(x)
+        logits = self.fc(features)
         return logits, physics_features
