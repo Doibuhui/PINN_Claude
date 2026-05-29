@@ -2,7 +2,7 @@
 % CWRU 多负载跨工况故障诊断 + MED 解卷积
 % 训练集: 0HP + 1HP, 测试集: 2HP (未见负载 → 考验泛化能力)
 % 10类轴承故障: Normal / IR007/014/021 / OR007/014/021 / Ball007/014/021
-% 滑窗 → MED解卷积 → CWT → 单通道灰度图 224×224
+% 滑窗 → MED解卷积 → CWT → 3通道图 224×224 (幅值+cos相位+sin相位)
 
 clear; clc; close all;
 
@@ -308,7 +308,7 @@ fprintf('输出目录: %s\n', output_root);
 fprintf('训练集:   %d (0HP + 1HP, 85%%)\n', size(X_train, 1));
 fprintf('验证集:   %d (0HP + 1HP, 15%%)\n', size(X_val, 1));
 fprintf('测试集:   %d (2HP, 100%%)\n', size(X_test, 1));
-fprintf('图像尺寸: %d×%d, 单通道\n', target_size(1), target_size(2));
+fprintf('图像尺寸: %d×%d, 3通道 (幅值+相位cos+相位sin)\n', target_size(1), target_size(2));
 fprintf('类别数:   %d\n', NUM_CLASSES);
 fprintf('MED解卷积: %s (filter_size=%d)\n', ...
         ternary(USE_MED, 'ON', 'OFF'), MED_FILTER_SIZE);
@@ -351,7 +351,7 @@ function y = med_deconv(x, L, max_iter, tol)
         start = i;
         X(i, :) = x_pad(start : start + L - 1)';
     end
-    X = flip(X, 2);
+    % X = flip(X, 2);  % FIXED: standard MED does not need flip
 
     % 初始化滤波器为中心脉冲
     f = zeros(L, 1);

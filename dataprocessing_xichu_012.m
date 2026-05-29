@@ -2,7 +2,7 @@
 % CWRU 多负载跨工况故障诊断
 % 训练集: 0HP + 1HP, 测试集: 2HP (未见负载 → 考验泛化能力)
 % 10类轴承故障: Normal / IR007/014/021 / OR007/014/021 / Ball007/014/021
-% CWT时频图, 单通道灰度, 统一 resize 224×224
+% CWT时频图, 3通道 (幅值+cos相位+sin相位), 统一 resize 224×224
 
 clear; clc; close all;
 
@@ -297,6 +297,6 @@ fprintf('输出目录: %s\n', output_root);
 fprintf('训练集:   %d (0HP + 1HP, 85%%)\n', size(X_train, 1));
 fprintf('验证集:   %d (0HP + 1HP, 15%%)\n', size(X_val, 1));
 fprintf('测试集:   %d (2HP, 100%%)\n', size(X_test, 1));
-fprintf('图像尺寸: %d×%d, 单通道\n', target_size(1), target_size(2));
+fprintf('图像尺寸: %d×%d, 3通道 (幅值+相位cos+相位sin)\n', target_size(1), target_size(2));
 fprintf('类别数:   %d\n', NUM_CLASSES);
 fprintf('\n训练配置默认: 0HP+1HP → 测试 2HP (跨负载泛化)\n');
